@@ -1883,7 +1883,7 @@ Stars: {balance} ⭐
         asyncio.get_event_loop().run_until_complete(self.start_keep_alive())
         
         # Start bot
-        logger.info("🤖 Telegram Bot is now running...")
+        logger.info("Telegram Bot is now running...")
         self.application.run_polling()
 
 def main():
