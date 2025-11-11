@@ -57,6 +57,558 @@ def stats():
         "uptime": get_uptime()
     })
 
+def get_uptime():
+    """Calculate uptime for health checks"""
+    if not hasattr(get_uptime, 'start_time'):
+        get_uptime.start_time = datetime.now()
+    uptime = datetime.now() - get_uptime.start_time
+    return str(uptime).split('.')[0]  # Remove microseconds
+
+def get_app_url():
+    """Automatically detect the app URL"""
+    # Try to get from Render's environment variables first
+    render_external_url = os.getenv('RENDER_EXTERNAL_URL')
+    if render_external_url:
+        return render_external_url
+    
+    # Fallback to RENDER_APP_URL
+    render_app_url = os.getenv('RENDER_APP_URL')
+    if render_app_url:
+        return render_app_url
+    
+    # Fallback to localhost
+    port = os.getenv('PORT', 5000)
+    return f"http://localhost:{port}"
+
+class DatabaseManager:
+    @staticmethod
+    def init_database():
+        """Initialize SQLite database"""
+        conn = sqlite3.connect('bot_hosting.db', check_same_thread=False)
+        cursor = conn.cursor()
+        
+        # Users table with user tier
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY,
+                username TEXT,
+                balance INTEGER DEFAULT 0,
+                is_admin BOOLEAN DEFAULT FALSE,
+                user_tier TEXT DEFAULT 'regular',  -- regular, premium
+                max_bots INTEGER DEFAULT 1,        -- 1 for regular, 20 for premium
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Bots table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS bots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                bot_token TEXT,
+                bot_username TEXT,
+                deployment_path TEXT,
+                is_active BOOLEAN DEFAULT FALSE,
+                restart_count INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                expires_at TIMESTAMP,
+                last_ping TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                status TEXT DEFAULT 'deployed',
+                FOREIGN KEY (user_id) REFERENCES users (id)
+            )
+        ''')
+        
+        # Payments table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS payments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                amount INTEGER,
+                transaction_type TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users (id)
+            )
+        ''')
+        
+        # System stats table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS system_stats (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                total_deployments INTEGER DEFAULT 0,
+                active_bots INTEGER DEFAULT 0,
+                recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Keep alive logs table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS keep_alive_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ping_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                status TEXT,
+                response_time REAL
+            )
+        ''')
+        
+        conn.commit()
+        conn.close()
+    
+    @staticmethod
+    def get_user_tier(user_id: int) -> dict:
+        """Get user tier and bot limits"""
+        conn = sqlite3.connect('bot_hosting.db', check_same_thread=False)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT user_tier, max_bots, is_admin FROM users WHERE id = ?
+        ''', (user_id,))
+        
+        result = cursor.fetchone()
+        
+        if not result:
+            # Create user with default regular tier
+            cursor.execute('''
+                INSERT INTO users (id, user_tier, max_bots) VALUES (?, ?, ?)
+            ''', (user_id, 'regular', 1))
+            conn.commit()
+            user_tier = 'regular'
+            max_bots = 1
+            is_admin = False
+        else:
+            user_tier = result[0]
+            max_bots = result[1]
+            is_admin = bool(result[2])
+        
+        conn.close()
+        
+        return {
+            'tier': user_tier,
+            'max_bots': max_bots,
+            'is_admin': is_admin
+        }
+    
+    @staticmethod
+    def get_user_bot_count(user_id: int) -> int:
+        """Get number of bots deployed by user"""
+        conn = sqlite3.connect('bot_hosting.db', check_same_thread=False)
+        cursor = conn.cursor()
+        
+        cursor.execute('SELECT COUNT(*) FROM bots WHERE user_id = ?', (user_id,))
+        count = cursor.fetchone()[0]
+        conn.close()
+        return count
+    
+    @staticmethod
+    def upgrade_user_tier(user_id: int, tier: str) -> bool:
+        """Upgrade user to premium tier"""
+        conn = sqlite3.connect('bot_hosting.db', check_same_thread=False)
+        cursor = conn.cursor()
+        
+        try:
+            if tier == 'premium':
+                cursor.execute('''
+                    UPDATE users SET user_tier = ?, max_bots = 20 WHERE id = ?
+                ''', (tier, user_id))
+                conn.commit()
+                return True
+            elif tier == 'regular':
+                cursor.execute('''
+                    UPDATE users SET user_tier = ?, max_bots = 1 WHERE id = ?
+                ''', (tier, user_id))
+                conn.commit()
+                return True
+            return False
+        except Exception as e:
+            logger.error(f"Error upgrading user tier: {e}")
+            return False
+        finally:
+            conn.close()
+    
+    @staticmethod
+    def add_bot_deployment(user_id: int, bot_token: str, bot_username: str, deployment_path: str, expires_at: datetime) -> int:
+        conn = sqlite3.connect('bot_hosting.db', check_same_thread=False)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            INSERT INTO bots (user_id, bot_token, bot_username, deployment_path, expires_at)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (user_id, bot_token, bot_username, deployment_path, expires_at))
+        
+        bot_id = cursor.lastrowid
+        
+        # Update stats
+        cursor.execute('''
+            INSERT INTO system_stats (total_deployments, active_bots)
+            VALUES (1, 1)
+        ''')
+        
+        conn.commit()
+        conn.close()
+        return bot_id
+    
+    @staticmethod
+    def get_user_bots(user_id: int):
+        conn = sqlite3.connect('bot_hosting.db', check_same_thread=False)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT id, user_id, bot_username, is_active, restart_count, 
+                   created_at, expires_at, last_ping, status
+            FROM bots 
+            WHERE user_id = ?
+            ORDER BY created_at DESC
+        ''', (user_id,))
+        
+        bots = []
+        for row in cursor.fetchall():
+            bots.append({
+                'id': row[0],
+                'user_id': row[1],
+                'bot_username': row[2],
+                'is_active': bool(row[3]),
+                'restart_count': row[4],
+                'created_at': row[5],
+                'expires_at': row[6],
+                'last_ping': row[7],
+                'status': row[8]
+            })
+        
+        conn.close()
+        return bots
+    
+    @staticmethod
+    def get_bot_info(bot_id: int):
+        conn = sqlite3.connect('bot_hosting.db', check_same_thread=False)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT id, user_id, bot_token, bot_username, is_active, restart_count, 
+                   created_at, expires_at, last_ping, status
+            FROM bots 
+            WHERE id = ?
+        ''', (bot_id,))
+        
+        row = cursor.fetchone()
+        conn.close()
+        
+        if not row:
+            return None
+        
+        return {
+            'id': row[0],
+            'user_id': row[1],
+            'bot_token': row[2],
+            'bot_username': row[3],
+            'is_active': bool(row[4]),
+            'restart_count': row[5],
+            'created_at': row[6],
+            'expires_at': row[7],
+            'last_ping': row[8],
+            'status': row[9]
+        }
+    
+    @staticmethod
+    def update_bot_status(bot_id: int, status: str, is_active: bool = None):
+        conn = sqlite3.connect('bot_hosting.db', check_same_thread=False)
+        cursor = conn.cursor()
+        
+        if is_active is not None:
+            cursor.execute('''
+                UPDATE bots SET status = ?, is_active = ?, last_ping = ? 
+                WHERE id = ?
+            ''', (status, is_active, datetime.now(), bot_id))
+        else:
+            cursor.execute('''
+                UPDATE bots SET status = ?, last_ping = ? 
+                WHERE id = ?
+            ''', (status, datetime.now(), bot_id))
+        
+        conn.commit()
+        conn.close()
+    
+    @staticmethod
+    def get_active_bots_count():
+        conn = sqlite3.connect('bot_hosting.db', check_same_thread=False)
+        cursor = conn.cursor()
+        
+        cursor.execute('SELECT COUNT(*) FROM bots WHERE is_active = TRUE')
+        count = cursor.fetchone()[0]
+        conn.close()
+        return count
+    
+    @staticmethod
+    def get_total_users():
+        conn = sqlite3.connect('bot_hosting.db', check_same_thread=False)
+        cursor = conn.cursor()
+        
+        cursor.execute('SELECT COUNT(DISTINCT user_id) FROM bots')
+        count = cursor.fetchone()[0]
+        conn.close()
+        return count
+    
+    @staticmethod
+    def get_total_deployments():
+        conn = sqlite3.connect('bot_hosting.db', check_same_thread=False)
+        cursor = conn.cursor()
+        
+        cursor.execute('SELECT COUNT(*) FROM bots')
+        count = cursor.fetchone()[0]
+        conn.close()
+        return count
+    
+    @staticmethod
+    def log_keep_alive(status: str, response_time: float):
+        conn = sqlite3.connect('bot_hosting.db', check_same_thread=False)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            INSERT INTO keep_alive_logs (status, response_time)
+            VALUES (?, ?)
+        ''', (status, response_time))
+        
+        # Keep only last 100 logs to prevent DB bloat
+        cursor.execute('''
+            DELETE FROM keep_alive_logs 
+            WHERE id NOT IN (
+                SELECT id FROM keep_alive_logs 
+                ORDER BY id DESC LIMIT 100
+            )
+        ''')
+        
+        conn.commit()
+        conn.close()
+
+class PaymentManager:
+    @staticmethod
+    def get_user_balance(user_id: int) -> int:
+        conn = sqlite3.connect('bot_hosting.db', check_same_thread=False)
+        cursor = conn.cursor()
+        
+        cursor.execute('SELECT balance FROM users WHERE id = ?', (user_id,))
+        result = cursor.fetchone()
+        
+        if not result:
+            cursor.execute('INSERT INTO users (id, balance) VALUES (?, ?)', (user_id, 0))
+            conn.commit()
+            balance = 0
+        else:
+            balance = result[0]
+        
+        conn.close()
+        return balance
+    
+    @staticmethod
+    def deduct_stars(user_id: int, amount: int) -> bool:
+        conn = sqlite3.connect('bot_hosting.db', check_same_thread=False)
+        cursor = conn.cursor()
+        
+        try:
+            cursor.execute('SELECT balance FROM users WHERE id = ?', (user_id,))
+            result = cursor.fetchone()
+            
+            if not result or result[0] < amount:
+                return False
+            
+            cursor.execute(
+                'UPDATE users SET balance = balance - ? WHERE id = ?',
+                (amount, user_id)
+            )
+            
+            cursor.execute(
+                'INSERT INTO payments (user_id, amount, transaction_type) VALUES (?, ?, ?)',
+                (user_id, amount, 'deployment')
+            )
+            
+            conn.commit()
+            return True
+            
+        except Exception as e:
+            logger.error(f"Payment deduction error: {e}")
+            conn.rollback()
+            return False
+        finally:
+            conn.close()
+    
+    @staticmethod
+    def add_stars(user_id: int, amount: int):
+        conn = sqlite3.connect('bot_hosting.db', check_same_thread=False)
+        cursor = conn.cursor()
+        
+        try:
+            cursor.execute(
+                'UPDATE users SET balance = balance + ? WHERE id = ?',
+                (amount, user_id)
+            )
+            
+            cursor.execute(
+                'INSERT INTO payments (user_id, amount, transaction_type) VALUES (?, ?, ?)',
+                (user_id, amount, 'deposit')
+            )
+            
+            conn.commit()
+            
+        except Exception as e:
+            logger.error(f"Add stars error: {e}")
+            conn.rollback()
+        finally:
+            conn.close()
+
+class KeepAliveSystem:
+    def __init__(self):
+        self.is_running = True
+        self.ping_count = 0
+        
+    async def start(self):
+        """Start keep-alive system with 4-minute intervals"""
+        logger.info("🚀 Starting keep-alive system with 4-minute intervals...")
+        
+        while self.is_running:
+            try:
+                self.ping_count += 1
+                start_time = time.time()
+                
+                # Get app URL automatically
+                app_url = get_app_url()
+                
+                # Ping health endpoint to keep Render awake
+                try:
+                    response = requests.get(f'{app_url}/health', timeout=10)
+                    response_time = round((time.time() - start_time) * 1000, 2)
+                    
+                    if response.status_code == 200:
+                        status = "success"
+                        logger.info(f"✅ Keep-alive ping #{self.ping_count} to {app_url} - {response_time}ms")
+                    else:
+                        status = f"http_error_{response.status_code}"
+                        logger.warning(f"⚠️ Keep-alive ping #{self.ping_count} HTTP error: {response.status_code}")
+                    
+                    DatabaseManager.log_keep_alive(status, response_time)
+                    
+                except requests.exceptions.RequestException as e:
+                    response_time = round((time.time() - start_time) * 1000, 2)
+                    status = f"error_{type(e).__name__}"
+                    logger.warning(f"⚠️ Keep-alive ping #{self.ping_count} failed: {e}")
+                    DatabaseManager.log_keep_alive(status, response_time)
+                
+                # Clean up expired bots every 12 pings (every 48 minutes)
+                if self.ping_count % 12 == 0:
+                    self.cleanup_expired_bots()
+                
+                # Update bot statuses every 6 pings (every 24 minutes)
+                if self.ping_count % 6 == 0:
+                    self.update_bot_statuses()
+                
+                # Log summary every 10 pings (every 40 minutes)
+                if self.ping_count % 10 == 0:
+                    self.log_system_summary()
+                
+                # Wait for 4 minutes before next ping (240 seconds)
+                logger.debug(f"⏰ Waiting 4 minutes until next ping...")
+                await asyncio.sleep(240)  # 4 minutes
+                
+            except Exception as e:
+                logger.error(f"❌ Keep-alive system error: {e}")
+                await asyncio.sleep(60)  # Wait 1 minute on error
+    
+    def cleanup_expired_bots(self):
+        """Clean up expired bot deployments"""
+        try:
+            conn = sqlite3.connect('bot_hosting.db', check_same_thread=False)
+            cursor = conn.cursor()
+            
+            cursor.execute(
+                'DELETE FROM bots WHERE expires_at < ?',
+                (datetime.now(),)
+            )
+            
+            deleted_count = cursor.rowcount
+            if deleted_count > 0:
+                logger.info(f"🧹 Cleaned up {deleted_count} expired bots")
+            
+            conn.commit()
+            conn.close()
+            
+        except Exception as e:
+            logger.error(f"❌ Cleanup error: {e}")
+    
+    def update_bot_statuses(self):
+        """Update bot statuses based on last ping"""
+        try:
+            conn = sqlite3.connect('bot_hosting.db', check_same_thread=False)
+            cursor = conn.cursor()
+            
+            # Mark bots as inactive if no ping in last 10 minutes
+            ten_min_ago = datetime.now() - timedelta(minutes=10)
+            cursor.execute(
+                'UPDATE bots SET is_active = FALSE WHERE last_ping < ?',
+                (ten_min_ago,)
+            )
+            
+            updated_count = cursor.rowcount
+            if updated_count > 0:
+                logger.info(f"🔄 Updated {updated_count} bots to inactive")
+            
+            conn.commit()
+            conn.close()
+            
+        except Exception as e:
+            logger.error(f"❌ Status update error: {e}")
+    
+    def log_system_summary(self):
+        """Log system summary periodically"""
+        active_bots = DatabaseManager.get_active_bots_count()
+        total_users = DatabaseManager.get_total_users()
+        total_deployments = DatabaseManager.get_total_deployments()
+        
+        logger.info(f"📊 System Summary - Bots: {active_bots}, Users: {total_users}, Deployments: {total_deployments}")
+
+class BotProcessor:
+    @staticmethod
+    def extract_bot_token(python_code: str) -> tuple:
+        """Extract bot token from Python code using multiple methods"""
+        # Method 1: Look for common patterns
+        patterns = [
+            r'BOT_TOKEN\s*=\s*["\']([^"\']+)["\']',
+            r'TOKEN\s*=\s*["\']([^"\']+)["\']',
+            r'bot_token\s*=\s*["\']([^"\']+)["\']',
+            r'token\s*=\s*["\']([^"\']+)["\']',
+            r'["\']([0-9]{8,11}:[A-Za-z0-9_-]{35})["\']'
+        ]
+        
+        for pattern in patterns:
+            matches = re.findall(pattern, python_code)
+            if matches:
+                token = matches[0]
+                logger.info(f"✅ Bot token found using pattern: {pattern}")
+                return token, True
+        
+        return None, False
+    
+    @staticmethod
+    def validate_bot_token(token: str) -> bool:
+        """Validate if the token format is corr        "status": "healthy", 
+        "timestamp": datetime.now().isoformat(),
+        "service": "Bot Hosting Service",
+        "uptime": get_uptime()
+    })
+
+@app.route('/ping')
+def ping():
+    return jsonify({
+        "status": "pong", 
+        "timestamp": datetime.now().isoformat(),
+        "message": "Service is alive and responding"
+    })
+
+@app.route('/stats')
+def stats():
+    return jsonify({
+        "active_bots": DatabaseManager.get_active_bots_count(),
+        "total_users": DatabaseManager.get_total_users(),
+        "total_deployments": DatabaseManager.get_total_deployments(),
+        "uptime": get_uptime()
+    })
+
 def run_flask_app():
     """Run Flask app for health checks"""
     port = int(os.getenv('PORT', 5000))
