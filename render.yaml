@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: telegram-bot-host
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot_hosting_service.py
+    envVars:
+      - key: BOT_TOKEN
+        value: 8315224173:AAEykdS0tMoRcm6jkjwOV9fVO2EhfGZEFvA
+      - key: ADMIN_IDS
+        value: "7520259263"
